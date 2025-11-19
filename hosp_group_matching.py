@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Restaurant Hospitality Group Finder
-This script processes a CSV of restaurants and uses Perplexity API to identify 
+This script processes a CSV of restaurants and uses Claude API with web search to identify 
 if each restaurant is part of a larger hospitality group.
 """
 
@@ -9,20 +9,21 @@ import pandas as pd
 import requests
 import time
 import os
-from typing import Optional
+import json
+from typing import Tuple
 
 # Configuration
 INPUT_CSV = "signed_restaurants.csv"
 OUTPUT_CSV = "restaurants_with_hospitality_groups.csv"
-PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")  # Set this environment variable
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # Set this environment variable
 
-# Rate limiting (adjust based on your Perplexity plan)
-REQUEST_DELAY = 1  # seconds between requests
+# Rate limiting
+REQUEST_DELAY = 2  # seconds between requests (Claude API is generous but let's be respectful)
 
 
-def search_hospitality_group(restaurant_name: str, location: str = "", domain: str = "") -> str:
+def search_hospitality_group(restaurant_name: str, location: str = "", domain: str = "") -> Tuple[str, str]:
     """
-    Search Perplexity API to determine if a restaurant is part of a hospitality group.
+    Use Claude API with web search to determine if a restaurant is part of a hospitality group.
     
     Args:
         restaurant_name: Name of the restaurant
@@ -30,73 +31,72 @@ def search_hospitality_group(restaurant_name: str, location: str = "", domain: s
         domain: Restaurant's domain name (optional)
     
     Returns:
-        Name of hospitality group or "Independent" if none found
+        Tuple of (hospitality_group_name, total_locations)
     """
-    if not PERPLEXITY_API_KEY:
-        return "ERROR: No API key"
+    if not ANTHROPIC_API_KEY:
+        return "ERROR: No API key", ""
     
-    # Construct search query
-    query_parts = [f'"{restaurant_name}"']
-    if domain:
-        query_parts.append(f'domain "{domain}"')
-    if location:
-        query_parts.append(f'in {location}')
+    # Construct search query for Claude
+    location_str = f" in {location}" if location else ""
+    domain_str = f" (website: {domain})" if domain else ""
     
-    query = (
-        f"Is {' '.join(query_parts)} part of a restaurant group or hospitality group? "
-        f"If yes, provide ONLY the name of the parent company/restaurant group. "
-        f"If it's an independent restaurant with no parent company, respond with 'Independent'. "
-        f"Keep your answer to just the group name or 'Independent'."
-    )
+    prompt = f"""Search for information about "{restaurant_name}" restaurant{location_str}{domain_str}.
+
+Please determine:
+1. Is this restaurant part of a larger hospitality/restaurant group or management company?
+2. If yes, what is the exact name of the parent company or restaurant group?
+3. Approximately how many total restaurant locations does this group operate?
+
+Respond in this exact format:
+Group Name: [exact name of parent company/group, or "Independent" if it's a standalone restaurant]
+Total Locations: [number, or "1" if independent, or "Unknown" if you can't find this info]
+
+Be concise and only provide the requested information."""
     
     try:
         response = requests.post(
-            "https://api.perplexity.ai/chat/completions",
+            "https://api.anthropic.com/v1/messages",
             headers={
-                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                "Content-Type": "application/json"
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
             },
             json={
-                "model": "sonar",  # Fast and affordable model for quick searches (as of Feb 2025)
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
                 "messages": [
                     {
-                        "role": "system",
-                        "content": "You are a concise assistant that identifies restaurant ownership. Respond with only the hospitality group name or 'Independent'."
-                    },
-                    {
                         "role": "user",
-                        "content": query
+                        "content": prompt
                     }
-                ],
-                "temperature": 0.1,  # Low temperature for more deterministic results
-                "max_tokens": 100
+                ]
             },
-            timeout=30
+            timeout=60
         )
         
         if response.status_code == 200:
             result = response.json()
-            answer = result['choices'][0]['message']['content'].strip()
+            answer = result['content'][0]['text'].strip()
             
-            # Clean up the response
-            answer = answer.replace('"', '').strip()
+            # Parse the structured response
+            group_name = "Unknown"
+            total_locations = ""
             
-            # If response is too long or contains explanation, try to extract just the name
-            if len(answer) > 100:
-                # Look for common patterns
-                if "independent" in answer.lower():
-                    return "Independent"
-                # Try to get first sentence or line
-                answer = answer.split('.')[0].split('\n')[0].strip()
+            for line in answer.split('\n'):
+                line = line.strip()
+                if line.startswith("Group Name:"):
+                    group_name = line.replace("Group Name:", "").strip()
+                elif line.startswith("Total Locations:"):
+                    total_locations = line.replace("Total Locations:", "").strip()
             
-            return answer if answer else "Unknown"
+            return group_name, total_locations
         else:
             print(f"API Error {response.status_code}: {response.text}")
-            return f"ERROR: {response.status_code}"
+            return f"ERROR: {response.status_code}", ""
             
     except Exception as e:
         print(f"Error processing {restaurant_name}: {str(e)}")
-        return f"ERROR: {str(e)}"
+        return f"ERROR: {str(e)}", ""
 
 
 def process_restaurants(input_file: str, output_file: str):
@@ -110,9 +110,11 @@ def process_restaurants(input_file: str, output_file: str):
     print(f"Reading {input_file}...")
     df = pd.read_csv(input_file)
     
-    # Add new column if it doesn't exist
+    # Add new columns if they don't exist
     if "Hospitality Group" not in df.columns:
         df["Hospitality Group"] = ""
+    if "Total Locations" not in df.columns:
+        df["Total Locations"] = ""
     
     total_rows = len(df)
     print(f"Found {total_rows} restaurants to process")
@@ -130,10 +132,11 @@ def process_restaurants(input_file: str, output_file: str):
         
         print(f"[{idx+1}/{total_rows}] Searching for: {restaurant_name}...")
         
-        hospitality_group = search_hospitality_group(restaurant_name, location, domain)
+        hospitality_group, total_locations = search_hospitality_group(restaurant_name, location, domain)
         df.at[idx, "Hospitality Group"] = hospitality_group
+        df.at[idx, "Total Locations"] = total_locations
         
-        print(f"  → Result: {hospitality_group}")
+        print(f"  → Result: {hospitality_group} ({total_locations} locations)")
         
         # Save progress after each row (in case of interruption)
         df.to_csv(output_file, index=False)
@@ -164,10 +167,10 @@ def process_restaurants(input_file: str, output_file: str):
 def main():
     """Main execution function."""
     # Check for API key
-    if not PERPLEXITY_API_KEY:
-        print("ERROR: PERPLEXITY_API_KEY environment variable not set!")
+    if not ANTHROPIC_API_KEY:
+        print("ERROR: ANTHROPIC_API_KEY environment variable not set!")
         print("\nPlease set your API key using:")
-        print("  export PERPLEXITY_API_KEY='your-api-key-here'")
+        print("  export ANTHROPIC_API_KEY='your-api-key-here'")
         print("\nOr edit the script to add it directly (not recommended for production)")
         return
     

@@ -10,10 +10,11 @@ import requests
 import time
 import os
 import json
+import re
 from typing import Tuple
 
 # Configuration
-INPUT_CSV = "signed_restaurants.csv"
+INPUT_CSV = "signed_restaurants_test.csv"
 OUTPUT_CSV = "restaurants_with_hospitality_groups.csv"
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")  # For Google search verification
@@ -132,71 +133,137 @@ def verify_with_serper(restaurant_name: str, location: str = "", domain: str = "
     
     # Search for restaurant group ownership info
     location_str = f" {location}" if location else ""
-    queries = [
-        f'"{restaurant_name}"{location_str} restaurant group owner parent company',
-        f'"{restaurant_name}"{location_str} hospitality group management',
-    ]
+    search_query = f'"{restaurant_name}"{location_str} restaurant group owner parent company hospitality'
     
     try:
-        for search_query in queries:
-            response = requests.post(
-                "https://google.serper.dev/search",
-                headers={
-                    "X-API-KEY": SERPER_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "q": search_query,
-                    "num": 10  # Get top 10 results
-                },
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                continue
-                
-            result = response.json()
-            
-            # Analyze search results for evidence of a parent company
-            all_text = ""
-            
-            # Check organic results
-            for item in result.get("organic", [])[:5]:  # Look at top 5 results
-                all_text += f"{item.get('title', '')} {item.get('snippet', '')} ".lower()
-            
-            # Check knowledge graph if present
-            if "knowledgeGraph" in result:
-                kg = result["knowledgeGraph"]
-                all_text += f"{kg.get('title', '')} {kg.get('description', '')} ".lower()
-                
-            # Look for indicators of a restaurant group
-            group_indicators = [
-                "restaurant group", "hospitality group", "restaurant collection",
-                "parent company", "owned by", "operates", "portfolio",
-                "management company", "dining group", "restaurant family"
-            ]
-            
-            # Look for specific group names in results (common ones)
-            known_groups = [
-                "quality branded", "culinary creative", "wise sons", 
-                "standard restaurants", "union square hospitality",
-                "lettuce entertain you", "hillstone restaurant group",
-                "bmr restaurant group", "taffer's tavern", "knead hospitality"
-            ]
-            
-            for indicator in group_indicators:
-                if indicator in all_text and restaurant_name.lower() in all_text:
-                    # Found potential evidence - extract group name if possible
-                    for group in known_groups:
-                        if group in all_text:
-                            return group.title(), "Unknown"
-                    
-                    # Generic indication of a group but can't identify specific name
-                    return "Part of Restaurant Group (verify manually)", "Unknown"
-            
-            time.sleep(0.5)  # Brief delay between queries
+        response = requests.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": SERPER_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "q": search_query,
+                "num": 10  # Get top 10 results
+            },
+            timeout=30
+        )
         
-        # No evidence found after searching - confirm as Independent
+        if response.status_code != 200:
+            return "Independent", "1"
+            
+        result = response.json()
+        
+        # Collect all relevant text from search results
+        search_snippets = []
+        
+        # Check organic results
+        for item in result.get("organic", [])[:8]:  # Look at top 8 results
+            title = item.get('title', '')
+            snippet = item.get('snippet', '')
+            if title or snippet:
+                search_snippets.append(f"{title}. {snippet}")
+        
+        # Check knowledge graph if present
+        if "knowledgeGraph" in result:
+            kg = result["knowledgeGraph"]
+            kg_text = f"{kg.get('title', '')} {kg.get('description', '')}".strip()
+            if kg_text:
+                search_snippets.append(kg_text)
+        
+        # If we have search results, use Perplexity to analyze them
+        if search_snippets and PERPLEXITY_API_KEY:
+            combined_snippets = "\n".join(search_snippets[:5])  # Use top 5 snippets
+            
+            analysis_prompt = f"""Based on these Google search results about "{restaurant_name}"{location_str}, determine if this restaurant is part of a hospitality/restaurant group:
+
+SEARCH RESULTS:
+{combined_snippets}
+
+Respond in this exact format:
+Group Name: [exact name of the parent company/restaurant group, or "Independent" if standalone]
+Total Locations: [number of total locations the group operates, or "1" if independent, or "Unknown" if unclear]
+
+Be specific with the group name if one is found."""
+            
+            try:
+                analysis_response = requests.post(
+                    "https://api.perplexity.ai/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "sonar-pro",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a restaurant industry analyst. Analyze search results to identify restaurant group ownership. Always respond in the exact format requested."
+                            },
+                            {
+                                "role": "user",
+                                "content": analysis_prompt
+                            }
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 250
+                    },
+                    timeout=30
+                )
+                
+                if analysis_response.status_code == 200:
+                    analysis_result = analysis_response.json()
+                    answer = analysis_result['choices'][0]['message']['content'].strip()
+                    
+                    # Parse the structured response
+                    group_name = "Independent"
+                    total_locations = "1"
+                    
+                    for line in answer.split('\n'):
+                        line = line.strip()
+                        if line.startswith("Group Name:"):
+                            group_name = line.replace("Group Name:", "").strip()
+                            group_name = group_name.replace("**", "").replace("*", "").strip()
+                        elif line.startswith("Total Locations:"):
+                            total_locations = line.replace("Total Locations:", "").strip()
+                            total_locations = total_locations.replace("**", "").replace("*", "").strip()
+                    
+                    return group_name, total_locations
+                    
+            except Exception as e:
+                print(f"    Error analyzing search results: {str(e)}")
+        
+        # Fallback: Simple pattern matching if Perplexity analysis fails
+        all_text = " ".join(search_snippets).lower()
+        
+        # Look for indicators of a restaurant group
+        group_indicators = [
+            "restaurant group", "hospitality group", "restaurant collection",
+            "parent company", "owned by", "operates", "portfolio",
+            "management company", "dining group", "restaurant family"
+        ]
+        
+        has_group_indicator = any(indicator in all_text for indicator in group_indicators)
+        
+        if has_group_indicator and restaurant_name.lower() in all_text:
+            # Look for specific group names using expanded list
+            # Common patterns that indicate group names
+            patterns = [
+                r'(?:owned by|part of|operates|managed by)\s+([A-Z][A-Za-z\s&]+(?:Group|Hospitality|Restaurant|Management|Collection|Dining|Company|LLC|Inc))',
+                r'([A-Z][A-Za-z\s&]+(?:Group|Hospitality|Restaurant|Management|Collection|Dining))\s+(?:owns|operates|manages)',
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, " ".join(search_snippets))
+                if matches:
+                    # Return the first match found
+                    group_name = matches[0].strip()
+                    return group_name, "Unknown"
+            
+            # If we found indicators but couldn't extract name
+            return "Part of Restaurant Group (verify manually)", "Unknown"
+        
+        # No evidence found - confirm as Independent
         return "Independent", "1"
         
     except Exception as e:

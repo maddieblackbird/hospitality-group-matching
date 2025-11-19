@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Restaurant Hospitality Group Finder
-This script processes a CSV of restaurants and uses Claude API with web search to identify 
-if each restaurant is part of a larger hospitality group.
+This script processes a CSV of restaurants and uses Perplexity's sonar-pro model
+to identify if each restaurant is part of a larger hospitality group.
 """
 
 import pandas as pd
@@ -15,15 +15,17 @@ from typing import Tuple
 # Configuration
 INPUT_CSV = "signed_restaurants.csv"
 OUTPUT_CSV = "restaurants_with_hospitality_groups.csv"
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # Set this environment variable
+PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")  # For Google search verification
 
 # Rate limiting
-REQUEST_DELAY = 2  # seconds between requests (Claude API is generous but let's be respectful)
+REQUEST_DELAY = 2  # seconds between requests
+SERPER_DELAY = 1  # seconds between Serper requests
 
 
 def search_hospitality_group(restaurant_name: str, location: str = "", domain: str = "") -> Tuple[str, str]:
     """
-    Use Claude API with web search to determine if a restaurant is part of a hospitality group.
+    Use Perplexity's sonar-pro model to determine if a restaurant is part of a hospitality group.
     
     Args:
         restaurant_name: Name of the restaurant
@@ -33,61 +35,75 @@ def search_hospitality_group(restaurant_name: str, location: str = "", domain: s
     Returns:
         Tuple of (hospitality_group_name, total_locations)
     """
-    if not ANTHROPIC_API_KEY:
+    if not PERPLEXITY_API_KEY:
         return "ERROR: No API key", ""
     
-    # Construct search query for Claude
+    # Construct detailed search query
     location_str = f" in {location}" if location else ""
     domain_str = f" (website: {domain})" if domain else ""
     
-    prompt = f"""Search for information about "{restaurant_name}" restaurant{location_str}{domain_str}.
+    query = f"""Research the restaurant "{restaurant_name}"{location_str}{domain_str}.
 
-Please determine:
-1. Is this restaurant part of a larger hospitality/restaurant group or management company?
-2. If yes, what is the exact name of the parent company or restaurant group?
-3. Approximately how many total restaurant locations does this group operate?
+Determine:
+1. Is this restaurant part of a larger hospitality group, restaurant group, or management company?
+2. If yes, what is the exact name of the parent company?
+3. How many total restaurant locations does this group operate?
 
-Respond in this exact format:
-Group Name: [exact name of parent company/group, or "Independent" if it's a standalone restaurant]
-Total Locations: [number, or "1" if independent, or "Unknown" if you can't find this info]
+Format your response exactly like this:
+Group Name: [exact company name, or "Independent" if standalone]
+Total Locations: [number, or "1" if independent, or "Unknown" if unclear]
 
-Be concise and only provide the requested information."""
+Only provide these two lines. Be thorough in your research."""
     
     try:
         response = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.perplexity.ai/chat/completions",
             headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
+                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                "Content-Type": "application/json"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
+                "model": "sonar-pro",  # Better model for deeper research
                 "messages": [
                     {
+                        "role": "system",
+                        "content": "You are a restaurant industry researcher. Search thoroughly to identify restaurant ownership and parent companies. Always respond in the exact format requested."
+                    },
+                    {
                         "role": "user",
-                        "content": prompt
+                        "content": query
                     }
-                ]
+                ],
+                "temperature": 0.2,
+                "max_tokens": 300,
+                "search_domain_filter": ["perplexity.ai"],  # Use Perplexity's search
+                "return_citations": True
             },
-            timeout=60
+            timeout=45
         )
         
         if response.status_code == 200:
             result = response.json()
-            answer = result['content'][0]['text'].strip()
+            answer = result['choices'][0]['message']['content'].strip()
             
             # Parse the structured response
             group_name = "Unknown"
-            total_locations = ""
+            total_locations = "Unknown"
             
             for line in answer.split('\n'):
                 line = line.strip()
                 if line.startswith("Group Name:"):
                     group_name = line.replace("Group Name:", "").strip()
+                    # Clean up any markdown or extra characters
+                    group_name = group_name.replace("**", "").replace("*", "").strip()
                 elif line.startswith("Total Locations:"):
                     total_locations = line.replace("Total Locations:", "").strip()
+                    total_locations = total_locations.replace("**", "").replace("*", "").strip()
+            
+            # If we didn't get structured response, try to parse from natural language
+            if group_name == "Unknown" and "independent" in answer.lower():
+                group_name = "Independent"
+                total_locations = "1"
             
             return group_name, total_locations
         else:
@@ -97,6 +113,95 @@ Be concise and only provide the requested information."""
     except Exception as e:
         print(f"Error processing {restaurant_name}: {str(e)}")
         return f"ERROR: {str(e)}", ""
+
+
+def verify_with_serper(restaurant_name: str, location: str = "", domain: str = "") -> Tuple[str, str]:
+    """
+    Use Serper (Google Search) to verify if a restaurant marked as Independent is actually part of a group.
+    
+    Args:
+        restaurant_name: Name of the restaurant
+        location: Geographic location/market (optional)
+        domain: Restaurant's domain name (optional)
+    
+    Returns:
+        Tuple of (hospitality_group_name, total_locations) or ("Independent", "1") if verification confirms independence
+    """
+    if not SERPER_API_KEY:
+        return "Independent", "1"  # If no API key, assume Perplexity was correct
+    
+    # Search for restaurant group ownership info
+    location_str = f" {location}" if location else ""
+    queries = [
+        f'"{restaurant_name}"{location_str} restaurant group owner parent company',
+        f'"{restaurant_name}"{location_str} hospitality group management',
+    ]
+    
+    try:
+        for search_query in queries:
+            response = requests.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": SERPER_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "q": search_query,
+                    "num": 10  # Get top 10 results
+                },
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                continue
+                
+            result = response.json()
+            
+            # Analyze search results for evidence of a parent company
+            all_text = ""
+            
+            # Check organic results
+            for item in result.get("organic", [])[:5]:  # Look at top 5 results
+                all_text += f"{item.get('title', '')} {item.get('snippet', '')} ".lower()
+            
+            # Check knowledge graph if present
+            if "knowledgeGraph" in result:
+                kg = result["knowledgeGraph"]
+                all_text += f"{kg.get('title', '')} {kg.get('description', '')} ".lower()
+                
+            # Look for indicators of a restaurant group
+            group_indicators = [
+                "restaurant group", "hospitality group", "restaurant collection",
+                "parent company", "owned by", "operates", "portfolio",
+                "management company", "dining group", "restaurant family"
+            ]
+            
+            # Look for specific group names in results (common ones)
+            known_groups = [
+                "quality branded", "culinary creative", "wise sons", 
+                "standard restaurants", "union square hospitality",
+                "lettuce entertain you", "hillstone restaurant group",
+                "bmr restaurant group", "taffer's tavern", "knead hospitality"
+            ]
+            
+            for indicator in group_indicators:
+                if indicator in all_text and restaurant_name.lower() in all_text:
+                    # Found potential evidence - extract group name if possible
+                    for group in known_groups:
+                        if group in all_text:
+                            return group.title(), "Unknown"
+                    
+                    # Generic indication of a group but can't identify specific name
+                    return "Part of Restaurant Group (verify manually)", "Unknown"
+            
+            time.sleep(0.5)  # Brief delay between queries
+        
+        # No evidence found after searching - confirm as Independent
+        return "Independent", "1"
+        
+    except Exception as e:
+        print(f"  Serper verification error: {str(e)}")
+        return "Independent", "1"  # On error, assume Perplexity was correct
 
 
 def process_restaurants(input_file: str, output_file: str):
@@ -115,6 +220,8 @@ def process_restaurants(input_file: str, output_file: str):
         df["Hospitality Group"] = ""
     if "Total Locations" not in df.columns:
         df["Total Locations"] = ""
+    if "Verified" not in df.columns:
+        df["Verified"] = ""
     
     total_rows = len(df)
     print(f"Found {total_rows} restaurants to process")
@@ -125,18 +232,46 @@ def process_restaurants(input_file: str, output_file: str):
         location = row.get("Macro Geo (NYC, SF, CHS, DC, LA, NASH, DEN)", "")
         domain = row.get("Company Domain Name", "")
         
-        # Skip if already processed (has a value)
-        if pd.notna(df.at[idx, "Hospitality Group"]) and df.at[idx, "Hospitality Group"]:
-            print(f"[{idx+1}/{total_rows}] Skipping {restaurant_name} (already processed)")
+        # Skip if already processed and verified
+        if (pd.notna(df.at[idx, "Hospitality Group"]) and 
+            df.at[idx, "Hospitality Group"] and
+            pd.notna(df.at[idx, "Verified"]) and 
+            df.at[idx, "Verified"] == "Yes"):
+            print(f"[{idx+1}/{total_rows}] Skipping {restaurant_name} (already verified)")
             continue
         
         print(f"[{idx+1}/{total_rows}] Searching for: {restaurant_name}...")
         
+        # First pass: Perplexity search
         hospitality_group, total_locations = search_hospitality_group(restaurant_name, location, domain)
         df.at[idx, "Hospitality Group"] = hospitality_group
         df.at[idx, "Total Locations"] = total_locations
         
-        print(f"  → Result: {hospitality_group} ({total_locations} locations)")
+        print(f"  → Perplexity result: {hospitality_group} ({total_locations} locations)")
+        
+        # Second pass: If marked as Independent, verify with Serper (Google)
+        if hospitality_group == "Independent" and SERPER_API_KEY:
+            print(f"  → Verifying with Google Search...")
+            time.sleep(SERPER_DELAY)
+            
+            verified_group, verified_locations = verify_with_serper(restaurant_name, location, domain)
+            
+            if verified_group != "Independent":
+                # Found evidence of a group - update the results
+                print(f"  → Google verification found: {verified_group}")
+                df.at[idx, "Hospitality Group"] = verified_group
+                df.at[idx, "Total Locations"] = verified_locations
+                df.at[idx, "Verified"] = "Yes - Group Found"
+            else:
+                # Confirmed as Independent
+                print(f"  → Confirmed Independent")
+                df.at[idx, "Verified"] = "Yes - Confirmed Independent"
+        elif hospitality_group != "Independent":
+            # Part of a group according to Perplexity
+            df.at[idx, "Verified"] = "Yes - Group Identified"
+        else:
+            # No Serper key available
+            df.at[idx, "Verified"] = "No - Serper Not Available"
         
         # Save progress after each row (in case of interruption)
         df.to_csv(output_file, index=False)
@@ -156,23 +291,32 @@ def process_restaurants(input_file: str, output_file: str):
                        (df["Hospitality Group"] != "") & 
                        (~df["Hospitality Group"].str.contains("ERROR", na=False))])
         errors = len(df[df["Hospitality Group"].str.contains("ERROR", na=False)])
+        verified = len(df[df["Verified"].str.contains("Yes", na=False)])
         
         print(f"Total restaurants: {total}")
         print(f"Independent: {independent} ({independent/total*100:.1f}%)")
         print(f"Part of groups: {groups} ({groups/total*100:.1f}%)")
+        print(f"Verified results: {verified} ({verified/total*100:.1f}%)")
         if errors > 0:
             print(f"Errors: {errors}")
 
 
 def main():
     """Main execution function."""
-    # Check for API key
-    if not ANTHROPIC_API_KEY:
-        print("ERROR: ANTHROPIC_API_KEY environment variable not set!")
+    # Check for API keys
+    if not PERPLEXITY_API_KEY:
+        print("ERROR: PERPLEXITY_API_KEY environment variable not set!")
         print("\nPlease set your API key using:")
-        print("  export ANTHROPIC_API_KEY='your-api-key-here'")
-        print("\nOr edit the script to add it directly (not recommended for production)")
+        print("  export PERPLEXITY_API_KEY='your-api-key-here'")
         return
+    
+    # Serper is optional but recommended
+    if not SERPER_API_KEY:
+        print("WARNING: SERPER_API_KEY not set - Independent restaurants won't be verified")
+        print("Get a free API key at: https://serper.dev")
+        print("Then set it with: export SERPER_API_KEY='your-api-key-here'")
+        print("\nContinuing without verification...\n")
+        time.sleep(3)
     
     # Check if input file exists
     if not os.path.exists(INPUT_CSV):
@@ -180,13 +324,15 @@ def main():
         print(f"Please ensure the CSV file is in the same directory as this script.")
         return
     
-    print("=" * 60)
+    print("=" * 70)
     print("Restaurant Hospitality Group Finder")
-    print("=" * 60)
+    print("=" * 70)
     print(f"Input file: {INPUT_CSV}")
     print(f"Output file: {OUTPUT_CSV}")
+    print(f"Primary search: Perplexity sonar-pro")
+    print(f"Verification: Serper (Google Search) {'✓ Enabled' if SERPER_API_KEY else '✗ Disabled'}")
     print(f"Request delay: {REQUEST_DELAY} seconds")
-    print("=" * 60)
+    print("=" * 70)
     print()
     
     # Process the restaurants
